@@ -36,6 +36,10 @@ ZAPRET_DIR="/opt/zapret2"
 SERVICE="zapret2"
 DOMAINS="www.youtube.com"
 LOGFILE="/var/log/zapret2-slipstream.log"
+# Куда сохранять СЫРЫЕ логи blockcheck2 (bc-tls13.log, bc-tls12.log, bc-quic.log) после прогона.
+# Без них разбор «почему QUIC не нашёлся» невозможен: там диагностика IP-блокировок, DNS и т.п.
+# Пусто — не сохранять. Перезаписываются при каждом запуске; предыдущие — с суффиксом .prev.
+BC_LOG_DIR="/var/lib/zapret2-slipstream"
 BOT_ID=""              # токен Telegram-бота (пусто = уведомления выключены)
 CHAT_ID=""             # id чата
 SOCKS5=""              # socks5 для Telegram (host:port или user:pass@host:port)
@@ -51,11 +55,15 @@ TIMEOUT_QUIC=300       # QUIC: 5 мин
 
 # Уровень перебора blockcheck (передаётся как SCANLEVEL):
 #   quick    — обрывать после первой же неудачи (самый поверхностный);
-#   standard — обычное «исследование» DPI (дефолт blockcheck, перебор НЕПОЛНЫЙ);
-#   force    — перебрать МАКСИМУМ стратегий (нужен для надёжного поиска ОБЩЕЙ 1.2+1.3,
-#              но заметно дольше — сам blockcheck рекомендует force для intersection).
+#   standard — обычное «исследование» DPI (дефолт самого blockcheck, перебор НЕПОЛНЫЙ:
+#              группы стратегий пропускаются по результатам предыдущих — и для 1.2/1.3
+#              и для разных доменов эти пропуски РАЗНЫЕ, списки становятся несопоставимы);
+#   force    — перебрать МАКСИМУМ стратегий, без пропусков. Порядок тот же, что в standard,
+#              обрыв по --want-* работает как обычно, так что до первых находок время почти
+#              то же. Единственный режим, в котором пересечения (1.2+1.3, домены) достоверны —
+#              сам blockcheck говорит это про свой intersection. Поэтому дефолт здесь — force.
 # Переопределяется параметром --scan-level.
-SCANLEVEL=standard
+SCANLEVEL=force
 
 # Путь к дефолтному env-файлу (переопределяется переменной AUTOSTRAT_ENV=... перед запуском).
 DEFAULT_ENV="${AUTOSTRAT_ENV:-/etc/zapret2-slipstream/.env}"
@@ -67,7 +75,7 @@ load_env() {
   [ -f "$_envf" ] || return 1
   while IFS= read -r _line; do
     case "$_line" in
-      BOT_ID=*|CHAT_ID=*|SOCKS5=*|ZAPRET_DIR=*|SERVICE=*|DOMAINS=*|LOGFILE=*)
+      BOT_ID=*|CHAT_ID=*|SOCKS5=*|ZAPRET_DIR=*|SERVICE=*|DOMAINS=*|LOGFILE=*|BC_LOG_DIR=*)
         _key=${_line%%=*}
         _val=${_line#*=}
         # снять обрамляющие кавычки, если есть
@@ -102,6 +110,8 @@ ZAPRET_DIR="$ZAPRET_DIR"
 SERVICE="$SERVICE"
 DOMAINS="$DOMAINS"
 LOGFILE="$LOGFILE"
+# Сырые логи blockcheck2 после прогона (пусто — не сохранять)
+BC_LOG_DIR="$BC_LOG_DIR"
 ENVEOF
   chmod 600 "$_envf" 2>/dev/null
   return 0
@@ -151,9 +161,10 @@ NFQWS2_OPT, вносит в конфиг (с бэкапом) и перезапу
 
   --scan-level УРОВЕНЬ   Глубина перебора blockcheck: quick | standard | force.
                         quick    — рвать после первой неудачи (поверхностно);
-                        standard — обычный перебор (дефолт, но НЕПОЛНЫЙ);
-                        force    — перебрать максимум стратегий (нужен для надёжного
-                                   поиска ОБЩЕЙ 1.2+1.3, но дольше). По умолчанию: standard.
+                        standard — перебор с пропусками (дефолт blockcheck; списки для
+                                   1.2/1.3 и разных доменов несопоставимы);
+                        force    — без пропусков; только в нём пересечение (общая 1.2+1.3,
+                                   несколько доменов) достоверно. По умолчанию: force.
 
   --env ПУТЬ            Прочитать дополнительный env-файл ПОВЕРХ дефолтного
                         (/etc/zapret2-slipstream/.env). Переопределяет совпадающие
@@ -172,8 +183,12 @@ NFQWS2_OPT, вносит в конфиг (с бэкапом) и перезапу
       BOT_ID, CHAT_ID, SOCKS5   — Telegram (пусто = уведомления выключены)
       ZAPRET_DIR                — каталог zapret2 (по умолч. /opt/zapret2)
       SERVICE                   — имя systemd-сервиса (по умолч. zapret2)
-      DOMAINS                   — домен(ы) для blockcheck (по умолч. www.youtube.com)
+      DOMAINS                   — домен(ы) для blockcheck через пробел (по умолч. www.youtube.com).
+                                  При нескольких — берутся стратегии, рабочие для ВСЕХ
+                                  (домены, идущие напрямую, не учитываются); blockcheck гоняется на каждый домен отдельно, таймаут — на домен
       LOGFILE                   — лог для --cron
+      BC_LOG_DIR                — куда класть сырые логи blockcheck2 после прогона
+                                  (по умолч. /var/lib/zapret2-slipstream; пусто — не сохранять)
   Лимиты (WANT_*/TIMEOUT_*) в .env НЕ выносятся — управляются флагами выше.
   Формат: VAR="значение". Комментарии — отдельной строкой (# ...), НЕ в конце строки.
   SOCKS5 нужен, если Telegram у провайдера заблокирован (прокси, через который он доступен).
@@ -185,7 +200,8 @@ NFQWS2_OPT, вносит в конфиг (с бэкапом) и перезапу
   sudo zapret2-slipstream.sh --want-tls 20         # больше находок → выше шанс общей
   sudo zapret2-slipstream.sh --want-tls 1 --want-quic 1   # самый быстрый: первые найденные
   sudo zapret2-slipstream.sh --want-tls 0 --timeout-tls 900   # полный перебор, но не дольше 15 мин
-  sudo zapret2-slipstream.sh --scan-level force --want-tls 0 --want-quic 0  # макс. перебор (долго!)
+  sudo zapret2-slipstream.sh --want-tls 0 --want-quic 0     # полный перебор всего (долго!)
+  sudo zapret2-slipstream.sh --scan-level standard          # быстрее, но пересечения ненадёжны
   sudo zapret2-slipstream.sh --env /home/user/my.env          # доп. настройки поверх дефолтных
   sudo zapret2-slipstream.sh --cron                # для crontab
 
@@ -286,6 +302,12 @@ tg_send() {
     || say "!!! Telegram: отправка не удалась (проверь SOCKS5/токен)."
 }
 htmlesc() { sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'; }
+
+# число доменов в DOMAINS: при >1 стратегии пересекаются по доменам, blockcheck запускается на каждый отдельно
+# shellcheck disable=SC2086
+DOMAINS="$(printf '%s\n' $DOMAINS | awk 'NF && !seen[$0]++' | tr '\n' ' ' | sed 's/ $//')"   # дубликаты убрать
+NDOM=$(printf '%s\n' $DOMAINS | grep -c .)
+[ "$NDOM" -ge 1 ] || { say "DOMAINS пуст — нечего проверять." >&2; exit 1; }
 
 [ "$(id -u)" = "0" ] || { say "Нужен root (sudo)." >&2; exit 1; }
 [ -x "$BLOCKCHECK" ] || { say "Не найден $BLOCKCHECK" >&2; exit 1; }
@@ -396,13 +418,31 @@ strays_msg() {  # строка для отчёта (пусто, если нич�
   printf '\n<b>Зачистка blockcheck:</b> процессов %s, правил/таблиц %s' "$STRAYS_PROCS" "$STRAYS_TABLES"
 }
 
-cleanup() { rm -rf "$TMP"; }
+# SERVICE_STOPPED=1 ставится сразу после остановки сервиса. cleanup() на EXIT — страховка
+# на ЛЮБОЙ путь выхода (ошибка, exit 1 из проверок, прерывание): если сервис останавливали мы
+# и он не поднят — поднять. Иначе неудачный запуск оставляет хост без обхода до ручного вмешательства.
+SERVICE_STOPPED=0
+cleanup() {
+  rm -rf "$TMP"
+  if [ "$SERVICE_STOPPED" = 1 ] && ! systemctl is-active --quiet "$SERVICE"; then
+    systemctl start "$SERVICE" >/dev/null 2>&1
+  fi
+}
 on_interrupt() {
-  say ""
-  say "!!! Прервано пользователем. Конфиг не изменён, поднимаю $SERVICE."
+  # Порядок принципиален. Ctrl+C прилетает всей группе терминала — в т.ч. `tee`, если вывод
+  # шёл через него. tee умирает, stdout становится трубой без читателя, и первый же `say`
+  # убивает скрипт SIGPIPE'ом до того, как он поднимет сервис. Поэтому: сначала запретить
+  # себя убивать (PIPE и повторный Ctrl+C), потом убрать blockcheck и его следы (sweep
+  # убивает ВСЕ nfqws2 — значит строго ДО старта сервиса), потом поднять сервис, и только
+  # потом разговаривать.
+  trap '' PIPE INT TERM
   kill_blockcheck
-  sweep_blockcheck " int"
+  sweep_blockcheck " int" 2>/dev/null
   systemctl start "$SERVICE" >/dev/null 2>&1
+  _msg="!!! Прервано пользователем. Конфиг не изменён, $SERVICE $(systemctl is-active "$SERVICE" 2>/dev/null)."
+  say ""; say "$_msg"
+  # если stdout был трубой в tee и tee уже мёртв — скажем хотя бы в терминал напрямую
+  [ -w /dev/tty ] && printf '\n%s\n' "$_msg" >/dev/tty 2>/dev/null
   cleanup
   tg_send "🟠 <b>zapret2-slipstream — прервано</b>
 Поиск остановлен вручную. Конфиг не тронут, <code>$SERVICE</code> запущен.
@@ -411,18 +451,62 @@ on_interrupt() {
 }
 trap on_interrupt INT TERM
 trap cleanup EXIT
+# Глобально PIPE НЕ игнорируем: конструкции вида `while … printf … done | head -1` тогда
+# начинают сыпать "printf: I/O error" (head вышел, цикл пишет в мёртвую трубу). Защита от
+# мёртвого stdout нужна только в обработчике прерывания — там она и стоит.
 
-# извлечь рабочие стратегии (строки nfqws2, у которых следующая строка — AVAILABLE)
-avail_lines() {  # $1=tag  $2=logfile
-  # Парсер вердиктов blockcheck.
-  # ВАЖНО: "UNAVAILABLE" содержит подстроку "AVAILABLE", поэтому UNAVAILABLE
-  # проверяется ПЕРВЫМ, а успех матчится по полному маркеру "!!!!! AVAILABLE !!!!!".
-  # Кандидат = последняя строка nfqws2 с нужным тегом; печатается при успехе.
+# ---- разбор лога blockcheck с учётом доменов ----
+# blockcheck гоняет домены из DOMAINS ПОСЛЕДОВАТЕЛЬНО (все стратегии для первого, потом
+# для второго...), а свой блок "* COMMON" печатает только в самом конце — до которого
+# при обрыве по количеству мы не доживаем. Поэтому пересечение по доменам считаем сами.
+# Формат строк blockcheck (домен есть в каждой):
+#   * <tag> ipv4 <dom>                    — начало теста домена
+#   - checking without DPI bypass         — затем AVAILABLE/UNAVAILABLE: работает ли напрямую
+#   - <tag> ipv4 <dom> : nfqws2 <strat>   — кандидат, следующий вердикт относится к нему
+#   !!!!! AVAILABLE !!!!!  /  UNAVAILABLE — вердикт
+#   <tag> ipv4 <dom> : working without bypass | test aborted ...  — строки SUMMARY
+# ВАЖНО: "UNAVAILABLE" содержит "AVAILABLE", поэтому проверяется первым, а успех — по полному маркеру.
+parse_run() {  # $1=tag $2=log → "seen|ok|nobp|abort<TAB>domain<TAB>strategy"
   awk -v tag="$1" '
-    /nfqws2 / && $0 ~ tag { cand=$0; next }
-    /UNAVAILABLE/ { cand=""; next }
-    /!!!!! AVAILABLE !!!!!/ { if (cand!="") { print cand; cand="" } ; next }
-  ' "$2"
+    $1=="*" && $2==tag                    { dom=$4; st="hdr"; cand=""; print "seen\t" dom "\t"; next }
+    $1=="-" && $2==tag && $5==":" && /nfqws2 / {
+      dom=$4; cand=$0; sub(/.*nfqws2 /,"",cand); st="cand"; print "seen\t" dom "\t"; next }
+    /^- checking without DPI bypass/      { st="nobp"; cand=""; next }
+    /UNAVAILABLE/                         { cand=""; if (st=="nobp") st="hdr"; next }
+    /!!!!! AVAILABLE !!!!!/ {
+      if (st=="nobp")      { print "nobp\t" dom "\t"; st="hdr" }
+      else if (cand!="")   { print "ok\t" dom "\t" cand }
+      cand=""; next }
+    $1==tag && $4==":" && /working without bypass/ { print "nobp\t"  $3 "\t"; next }
+    $1==tag && $4==":" && /test aborted/           { print "abort\t" $3 "\t"; next }
+  ' "$2" 2>/dev/null
+}
+
+# Рабочие стратегии, общие для ВСЕХ заблокированных доменов (домены, идущие напрямую или
+# упавшие с "test aborted", из пересечения исключаются — они ничего не ограничивают).
+# Порядок — как у blockcheck для первого домена (он приоритезирует хорошие стратегии).
+# При одном домене вырождается в простой список — поведение как раньше.
+avail_strats() {  # $1=tag $2=log
+  parse_run "$1" "$2" | awk -F'\t' '
+    { if (!($2 in dseen)) { dseen[$2]=1; dorder[++nd]=$2 } }
+    $1=="nobp" || $1=="abort" { skip[$2]=1; next }
+    $1=="ok" { if (!(($2 SUBSEP $3) in have)) { have[$2,$3]=1; if (!($3 in ord)) { ord[$3]=++k; sord[k]=$3 } } }
+    END {
+      n=0; for (i=1;i<=nd;i++) if (!(dorder[i] in skip)) n++
+      if (n==0) exit
+      for (i=1;i<=k;i++) { s=sord[i]; c=0
+        for (j=1;j<=nd;j++) { d=dorder[j]; if (!(d in skip) && ((d SUBSEP s) in have)) c++ }
+        if (c==n) print s }
+    }'
+}
+
+# Статистика по доменам для цикла опроса: "<seen> <nobp> <abort> <список seen через запятую>"
+run_dom_stats() {  # $1=tag $2=log
+  parse_run "$1" "$2" | awk -F'\t' '
+    { if (!($2 in d)) { d[$2]=1; seen++; lst=(lst=="")?$2:lst "," $2 } }
+    $1=="nobp"  { if (!($2 in nb)) { nb[$2]=1; nobp++ } }
+    $1=="abort" { if (!($2 in ab)) { ab[$2]=1; abort++ } }
+    END { printf "%d %d %d %s\n", seen+0, nobp+0, abort+0, lst }'
 }
 
 # Запускает blockcheck для одного протокола, следит за логом, обрывает после WANT рабочих.
@@ -453,73 +537,129 @@ run_protocol() {
     *)    _want="$WANT_TLS";  _tmo="$TIMEOUT_TLS"   ;;  # tls*: 0 → без обрыва по числу
   esac
 
-  if [ "$_want" -gt 0 ]; then
+  if [ "$NDOM" -gt 1 ]; then
+    say ">>> Прогон [$proto]: $NDOM доменов по очереди, каждый — до $( [ "$_want" -gt 0 ] && printf '%s общих' "$_want" || printf 'конца' )$( [ "$_tmo" -gt 0 ] && printf ', таймаут %d мин на домен' $((_tmo/60)) )…"
+  elif [ "$_want" -gt 0 ]; then
     say ">>> Прогон [$proto]: ищу до $_want рабочих$( [ "$_tmo" -gt 0 ] && printf ' (таймаут %d мин)' $((_tmo/60)) )…"
   else
     say ">>> Прогон [$proto]: полный перебор$( [ "$_tmo" -gt 0 ] && printf ', таймаут %d мин' $((_tmo/60)) || printf ' (до конца, без таймаута)' )…"
   fi
-  DOMAINS="$DOMAINS" \
-  IPV=4 \
-  SCANLEVEL="$SCANLEVEL" \
-  ENABLE_HTTP=0 ENABLE_HTTPS_TLS12=$EN_TLS12 ENABLE_HTTPS_TLS13=$EN_TLS13 ENABLE_HTTP3=$EN_HTTP3 \
-  CURL_TEST_HTTP=0 CURL_TEST_HTTPS_TLS12=$CT_TLS12 CURL_TEST_HTTPS_TLS13=$CT_TLS13 CURL_TEST_QUIC=$CT_QUIC \
-  BATCH=1 PARALLEL=1 \
-    $SETSID "$BLOCKCHECK" >"$RUN_LOG" 2>&1 &
-  BC_PID=$!
-  # setsid не должен форкаться (мы не лидер группы) → pgid blockcheck == его pid.
-  # Если это не так (job control? интерактивный sh?), убийство группой не сработает —
-  # тогда вся надежда на sweep_blockcheck. Не молчим об этом.
-  if [ -n "$SETSID" ]; then
-    _pg="$(ps -o pgid= -p "$BC_PID" 2>/dev/null | tr -d ' ')"
-    [ "$_pg" = "$BC_PID" ] || say "    [$proto] !!! blockcheck не в своей группе процессов (pid=$BC_PID pgid=${_pg:-?}) — group-kill не сработает, полагаюсь на sweep"
-  fi
 
-  run_start=$(date +%s)
-  while :; do
-    if ! kill -0 "$BC_PID" 2>/dev/null; then
-      say "    [$proto] blockcheck завершился сам."
-      break
+  # blockcheck запускается ОТДЕЛЬНО на каждый домен: снаружи его нельзя «перемотать» на следующий
+  # домен, только убить целиком, а значит при одном запуске на все домены первый домен не обрывался
+  # бы по количеству и мог съесть весь таймаут. Логи всех доменов копятся в один RUN_LOG —
+  # парсер различает домены по строкам blockcheck, пересечение считается по всему файлу.
+  : > "$RUN_LOG"
+  _idx=0
+  for _dom in $DOMAINS; do
+    _idx=$((_idx+1))
+    # порог обрыва по количеству: первый из нескольких доменов набирает want×2 — запас, из которого
+    # следующим доменам будет с чем пересекаться; остальные (и единственный) — want по общим.
+    _thr="$_want"
+    if [ "$_want" -gt 0 ] && [ "$NDOM" -gt 1 ] && [ "$_idx" -eq 1 ]; then _thr=$((_want*2)); fi
+    [ "$NDOM" -gt 1 ] && say "    [$proto] домен $_idx/$NDOM: $_dom$( [ "$_thr" -gt 0 ] && printf ' (до %s %s)' "$_thr" "$( [ "$_idx" -eq 1 ] && printf 'рабочих' || printf 'общих' )" )"
+
+    DOMAINS="$_dom" \
+    IPV=4 \
+    SCANLEVEL="$SCANLEVEL" \
+    ENABLE_HTTP=0 ENABLE_HTTPS_TLS12=$EN_TLS12 ENABLE_HTTPS_TLS13=$EN_TLS13 ENABLE_HTTP3=$EN_HTTP3 \
+    CURL_TEST_HTTP=0 CURL_TEST_HTTPS_TLS12=$CT_TLS12 CURL_TEST_HTTPS_TLS13=$CT_TLS13 CURL_TEST_QUIC=$CT_QUIC \
+    BATCH=1 PARALLEL=1 \
+      $SETSID "$BLOCKCHECK" >>"$RUN_LOG" 2>&1 &
+    BC_PID=$!
+    # setsid не должен форкаться (мы не лидер группы) → pgid blockcheck == его pid.
+    # Если это не так (job control? интерактивный sh?), убийство группой не сработает —
+    # тогда вся надежда на sweep_blockcheck. Не молчим об этом.
+    if [ -n "$SETSID" ]; then
+      _pg="$(ps -o pgid= -p "$BC_PID" 2>/dev/null | tr -d ' ')"
+      [ "$_pg" = "$BC_PID" ] || say "    [$proto] !!! blockcheck не в своей группе процессов (pid=$BC_PID pgid=${_pg:-?}) — group-kill не сработает, полагаюсь на sweep"
     fi
-    if grep -qiE "$RUN_TAG.*working without bypass" "$RUN_LOG" 2>/dev/null; then
-      say "    [$proto] проходит напрямую."
-      RUN_NOBP=1
-      kill_blockcheck
-      break
-    fi
-    n=$(avail_lines "$RUN_TAG" "$RUN_LOG" 2>/dev/null | wc -l)
-    # обрыв по количеству — только если _want>0 (QUIC)
-    if [ "$_want" -gt 0 ] && [ "$n" -ge "$_want" ]; then
-      say "    [$proto] найдено $n — обрываю."
-      kill_blockcheck
-      break
-    fi
-    now=$(date +%s); el=$((now-run_start))
-    _raw="$(tail -1 "$RUN_LOG" 2>/dev/null)"
-    # если в строке есть стратегия nfqws2 — показываем только её (после "nfqws2 "),
-    # иначе показываем служебную строку как есть (без префикса "- " и без обрезки)
-    case "$_raw" in
-      *"nfqws2 "*) last="nfqws2 $(printf '%s' "$_raw" | sed 's/.*nfqws2 //')" ;;
-      *)           last="$(printf '%s' "$_raw" | sed 's/^[[:space:]]*-[[:space:]]*//')" ;;
-    esac
-    say "    [$proto ${el}с] найдено=$n | $last"
-    # таймаут — только если _tmo>0
-    if [ "$_tmo" -gt 0 ] && [ "$el" -ge "$_tmo" ]; then
-      RUN_TIMED_OUT=1
-      say "    [$proto] !!! таймаут — обрываю."
-      kill_blockcheck
-      break
-    fi
-    sleep "$POLL_SEC"
+
+    run_start=$(date +%s)
+    while :; do
+      if ! kill -0 "$BC_PID" 2>/dev/null; then
+        say "    [$proto] blockcheck завершился сам."
+        break
+      fi
+      # этот домен проходит напрямую → в пересечении не участвует, дальше его гонять незачем
+      if parse_run "$RUN_TAG" "$RUN_LOG" | grep -q "^nobp	$_dom	"; then
+        say "    [$proto] $_dom проходит напрямую — исключаю из пересечения."
+        kill_blockcheck
+        break
+      fi
+      n=$(avail_strats "$RUN_TAG" "$RUN_LOG" | wc -l)
+      # обрыв по количеству — только когда ТЕКУЩИЙ домен уже появился в логе: пока blockcheck
+      # стартует, пересечение равно списку предыдущих доменов и порог «пройден» фиктивно
+      if [ "$_thr" -gt 0 ] && [ "$n" -ge "$_thr" ] && parse_run "$RUN_TAG" "$RUN_LOG" | grep -q "^seen	$_dom	"; then
+        say "    [$proto] найдено $n — обрываю."
+        kill_blockcheck
+        break
+      fi
+      now=$(date +%s); el=$((now-run_start))
+      _raw="$(tail -1 "$RUN_LOG" 2>/dev/null)"
+      # если в строке есть стратегия nfqws2 — показываем только её (после "nfqws2 "),
+      # иначе показываем служебную строку как есть (без префикса "- " и без обрезки)
+      case "$_raw" in
+        *"nfqws2 "*) last="nfqws2 $(printf '%s' "$_raw" | sed 's/.*nfqws2 //')" ;;
+        # эпилог blockcheck ("Please note this SUMMARY…", "It was designed…") — не прогресс
+        "Please note"*|"Understanding how"*|"This knowledge"*|"Blockcheck does"*|"It was designed"*) last="(итоги blockcheck)" ;;
+        *)           last="$(printf '%s' "$_raw" | sed 's/^[[:space:]]*-[[:space:]]*//')" ;;
+      esac
+      # пока текущий домен не появился в логе, n — это список предыдущих доменов; показываем прочерк
+      _nshow="$n"
+      parse_run "$RUN_TAG" "$RUN_LOG" | grep -q "^seen	$_dom	" || _nshow="—"
+      if [ "$NDOM" -gt 1 ]; then
+        say "    [$proto ${el}с] дом=$_idx/$NDOM $( [ "$_idx" -eq 1 ] && printf 'найдено' || printf 'общих' )=$_nshow | $last"
+      else
+        say "    [$proto ${el}с] найдено=$n | $last"
+      fi
+      # таймаут — на КАЖДЫЙ домен отдельно
+      if [ "$_tmo" -gt 0 ] && [ "$el" -ge "$_tmo" ]; then
+        RUN_TIMED_OUT=1
+        say "    [$proto] !!! таймаут на $_dom — обрываю."
+        kill_blockcheck
+        break
+      fi
+      sleep "$POLL_SEC"
+    done
+    wait "$BC_PID" 2>/dev/null
+    BC_PID=""
+    # blockcheck прибит или завершился — вычистить всё, что он мог оставить
+    sweep_blockcheck " $proto"
   done
-  wait "$BC_PID" 2>/dev/null
-  BC_PID=""
-  # blockcheck прибит или завершился — вычистить всё, что он мог оставить
-  sweep_blockcheck " $proto"
+
+  # напрямую проходят ВСЕ домены → протокол не заблокирован
+  # shellcheck disable=SC2046
+  set -- $(run_dom_stats "$RUN_TAG" "$RUN_LOG")
+  if [ "${2:-0}" -gt 0 ] && [ "${2:-0}" -ge "$NDOM" ]; then
+    say "    [$proto] проходит напрямую (все домены)."
+    RUN_NOBP=1
+  fi
+  # сохранить сырой лог blockcheck — в нём диагностика (IP block tests, DNS), которой нет в нашем выводе
+  if [ -n "$BC_LOG_DIR" ]; then
+    mkdir -p "$BC_LOG_DIR" 2>/dev/null
+    [ -f "$BC_LOG_DIR/bc-$proto.log" ] && mv -f "$BC_LOG_DIR/bc-$proto.log" "$BC_LOG_DIR/bc-$proto.log.prev" 2>/dev/null
+    cp -f "$RUN_LOG" "$BC_LOG_DIR/bc-$proto.log" 2>/dev/null || say "    [$proto] !!! не удалось сохранить сырой лог в $BC_LOG_DIR"
+  fi
+  # домены, до которых blockcheck не дошёл (таймаут / обрыв / не резолвится) — в пересечении
+  # они не участвуют, результат получен без них. Не молчим об этом.
+  # shellcheck disable=SC2046
+  set -- $(run_dom_stats "$RUN_TAG" "$RUN_LOG")
+  if [ "${1:-0}" -lt "$NDOM" ]; then
+    _lst=",${4:-},"
+    for _d in $DOMAINS; do
+      case "$_lst" in *",$_d,"*) ;; *) say "    [$proto] !!! домен $_d в тесте не появился — результат получен БЕЗ него" ;; esac
+    done
+  fi
+  if [ "${3:-0}" -gt 0 ]; then
+    say "    [$proto] !!! $3 домен(ов) с 'test aborted' (недоступен/не резолвится?) — исключены из пересечения"
+  fi
 }
 
 # ---------- начало ----------
 say ">>> Останавливаю $SERVICE, чищу conntrack..."
 systemctl stop "$SERVICE" 2>/dev/null
+SERVICE_STOPPED=1
 # дать сервису реально погасить свои nfqws2, прежде чем считать оставшиеся чужими
 _i=0; while [ "$_i" -lt 10 ] && systemctl is-active --quiet "$SERVICE"; do sleep 0.5; _i=$((_i+1)); done
 conntrack -F >/dev/null 2>&1
@@ -540,22 +680,23 @@ fi
 
 tg_send "$START_TITLE
 <code>$SERVICE</code> остановлен. Поиск стратегий: TLS1.3 → TLS1.2 → QUIC (общая для 1.2+1.3 в приоритете)…
-<b>Лимиты:</b> $LIMITS_MSG"
+<b>Лимиты:</b> $LIMITS_MSG
+<b>Домены:</b> $DOMAINS"
 
 # ---- ПРОГОН 1: TLS 1.3 ----
 run_protocol tls13
 TLS_LOG="$RUN_LOG"; TLS_NOBP="$RUN_NOBP"; TLS_TO="$RUN_TIMED_OUT"
-TLS_ALL="$(avail_lines "curl_test_https_tls13" "$TLS_LOG" | sed -n 's/.*nfqws2 //p')"
+TLS_ALL="$(avail_strats "curl_test_https_tls13" "$TLS_LOG")"
 
 # ---- ПРОГОН 2: TLS 1.2 ----
 run_protocol tls12
 TLS12_LOG="$RUN_LOG"; TLS12_NOBP="$RUN_NOBP"; TLS12_TO="$RUN_TIMED_OUT"
-TLS12_ALL="$(avail_lines "curl_test_https_tls12" "$TLS12_LOG" | sed -n 's/.*nfqws2 //p')"
+TLS12_ALL="$(avail_strats "curl_test_https_tls12" "$TLS12_LOG")"
 
 # ---- ПРОГОН 3: QUIC ----
 run_protocol quic
 QUIC_LOG="$RUN_LOG"; QUIC_NOBP="$RUN_NOBP"; QUIC_TO="$RUN_TIMED_OUT"
-QUIC_ALL="$(avail_lines "curl_test_http3" "$QUIC_LOG" | sed -n 's/.*nfqws2 //p')"
+QUIC_ALL="$(avail_strats "curl_test_http3" "$QUIC_LOG")"
 
 strip_payload() { sed -E 's/--payload=[^ ]+ *//g'; }
 
