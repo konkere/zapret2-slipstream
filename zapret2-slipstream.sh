@@ -293,16 +293,115 @@ htmlesc() { sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'; }
 
 TMP="$(mktemp -d)"
 BC_PID=""
+
+# blockcheck запускаем через setsid в СВОЕЙ группе процессов: тогда сигнал группе
+# достаёт не только blockcheck2.sh, но и nfqws2/tpws2, которые он держит в фоне
+# (это внуки, до которых pkill -P не добирался — они переезжали к PID 1 и жили дальше).
+SETSID=""
+command -v setsid >/dev/null 2>&1 && SETSID="setsid"
+
 kill_blockcheck() {
-  [ -n "$BC_PID" ] && kill "$BC_PID" 2>/dev/null
-  [ -n "$BC_PID" ] && pkill -P "$BC_PID" 2>/dev/null
+  [ -n "$BC_PID" ] || return 0
+  # мягко всей группе — даём blockcheck шанс на собственный cleanup
+  kill -s TERM -- "-$BC_PID" 2>/dev/null || kill -s TERM "$BC_PID" 2>/dev/null
+  _i=0
+  while [ "$_i" -lt 10 ] && kill -0 "$BC_PID" 2>/dev/null; do sleep 0.5; _i=$((_i+1)); done
+  # не послушался за 5с — жёстко
+  kill -s KILL -- "-$BC_PID" 2>/dev/null; kill -s KILL "$BC_PID" 2>/dev/null
   BC_PID=""
 }
+
+# --- зачистка следов blockcheck ---
+# blockcheck2 поднимает nfqws2/tpws2 в фоне и создаёт nft-таблицу inet blockcheck<PID>,
+# заворачивающую в них трафик к тестовым IP. Если его прибить по таймауту, он не успевает
+# убрать за собой: процесс остаётся висеть с тестовой стратегией, а таблица продолжает
+# гнать в него ВЕСЬ трафик к www.youtube.com — поверх штатного zapret2, без лимита
+# по пакетам. Несколько таких прогонов = несколько наложенных десинков на каждом
+# ClientHello. Поэтому чистим сами: после КАЖДОГО прогона, при прерывании и на старте.
+#
+# Инвариант: $SERVICE остановлен на всё время подбора, поэтому любой живой nfqws2/tpws2
+# в этот момент — чужой. Если у тебя есть ДРУГИЕ инстансы nfqws2/tpws2 вне $SERVICE —
+# этот скрипт их убьёт; так и задумано, другой надёжной эвристики нет.
+STRAYS_PROCS=0
+STRAYS_TABLES=0
+live_strays() {  # pid живых (не зомби) nfqws2/tpws2 через пробел
+  for _p in $(pgrep -x 'nfqws2|tpws2' 2>/dev/null); do
+    case "$(ps -o stat= -p "$_p" 2>/dev/null)" in Z*) ;; *) printf '%s ' "$_p" ;; esac
+  done
+}
+sweep_blockcheck() {  # $1 = метка для лога (необязательно)
+  _lbl="${1:-}"
+  # 1) сначала таблицы — иначе трафик к тестовым IP улетит в очередь без слушателя (= drop)
+  _tbl="$(nft list tables 2>/dev/null | awk '$1=="table" && $3 ~ /^blockcheck/ {print $2, $3}')"
+  if [ -n "$_tbl" ]; then
+    _n=$(printf '%s\n' "$_tbl" | wc -l)
+    printf '%s\n' "$_tbl" | while read -r _fam _name; do
+      [ -n "$_name" ] && nft delete table "$_fam" "$_name" 2>/dev/null
+    done
+    STRAYS_TABLES=$((STRAYS_TABLES+_n))
+    say "    [sweep$_lbl] удалено nft-таблиц blockcheck*: $_n"
+  fi
+  # 1б) iptables-режим blockcheck: цепочки blockcheck_{output,input}_<PID> в mangle
+  #     (прыжки из OUTPUT/INPUT, внутри NFQUEUE без --queue-bypass → без слушателя = drop)
+  #     и вспомогательные правила с комментарием blockcheck_<PID> в filter/raw.
+  #     Хук у них OUTPUT, т.е. страдает только трафик самого хоста — но это в т.ч.
+  #     наш собственный smoke-test. Чистим для iptables и ip6tables, no-op если пусто.
+  for _ipt in iptables ip6tables; do
+    command -v "$_ipt" >/dev/null 2>&1 || continue
+    command -v "${_ipt}-save" >/dev/null 2>&1 || continue
+    _n=0
+    # прыжки на цепочки blockcheck_* из OUTPUT/INPUT
+    "${_ipt}-save" -t mangle 2>/dev/null | grep -E '^-A (OUTPUT|INPUT) .*-j blockcheck_' | sed 's/^-A /-D /; s/"//g' > "$TMP/ipt.$_ipt"
+    while read -r _rule; do
+      # shellcheck disable=SC2086
+      [ -n "$_rule" ] && "$_ipt" -t mangle $_rule 2>/dev/null
+    done < "$TMP/ipt.$_ipt"
+    # сами цепочки
+    for _ch in $("${_ipt}-save" -t mangle 2>/dev/null | sed -n 's/^:\(blockcheck_[^ ]*\).*/\1/p'); do
+      "$_ipt" -t mangle -F "$_ch" 2>/dev/null
+      "$_ipt" -t mangle -X "$_ch" 2>/dev/null && _n=$((_n+1))
+    done
+    # вспомогательные правила по комментарию
+    for _tbl in filter raw mangle; do
+      "${_ipt}-save" -t "$_tbl" 2>/dev/null | grep -E '^-A .*--comment "?blockcheck_' | sed 's/^-A /-D /; s/"//g' > "$TMP/ipt.$_ipt.$_tbl"
+      while read -r _rule; do
+        # shellcheck disable=SC2086
+        [ -n "$_rule" ] && "$_ipt" -t "$_tbl" $_rule 2>/dev/null && _n=$((_n+1))
+      done < "$TMP/ipt.$_ipt.$_tbl"
+    done
+    if [ "$_n" -gt 0 ]; then
+      STRAYS_TABLES=$((STRAYS_TABLES+_n))
+      say "    [sweep$_lbl] $_ipt: снято цепочек/правил blockcheck_*: $_n"
+    fi
+  done
+  # 2) потом процессы
+  _pids="$(live_strays)"
+  if [ -n "$_pids" ]; then
+    _n=0
+    for _p in $_pids; do kill -s TERM "$_p" 2>/dev/null && _n=$((_n+1)); done
+    sleep 1
+    for _p in $(live_strays); do kill -s KILL "$_p" 2>/dev/null; done
+    STRAYS_PROCS=$((STRAYS_PROCS+_n))
+    say "    [sweep$_lbl] убито сиротских nfqws2/tpws2: $_n (pid: $_pids)"
+  fi
+  # 3) страховка: если после всего что-то осталось — говорим громко
+  if [ -n "$(live_strays)" ] || nft list tables 2>/dev/null | grep -q 'blockcheck' \
+     || { command -v iptables-save >/dev/null 2>&1 && iptables-save 2>/dev/null | grep -q 'blockcheck_'; }; then
+    say "!!! [sweep$_lbl] не удалось вычистить следы blockcheck полностью — проверь вручную:"
+    say "!!!   pgrep -a 'nfqws2|tpws2'; nft list tables; iptables-save | grep blockcheck_"
+  fi
+}
+strays_msg() {  # строка для отчёта (пусто, если ничего не чистили)
+  [ "$STRAYS_PROCS" -gt 0 ] || [ "$STRAYS_TABLES" -gt 0 ] || return 0
+  printf '\n<b>Зачистка blockcheck:</b> процессов %s, правил/таблиц %s' "$STRAYS_PROCS" "$STRAYS_TABLES"
+}
+
 cleanup() { rm -rf "$TMP"; }
 on_interrupt() {
   say ""
   say "!!! Прервано пользователем. Конфиг не изменён, поднимаю $SERVICE."
   kill_blockcheck
+  sweep_blockcheck " int"
   systemctl start "$SERVICE" >/dev/null 2>&1
   cleanup
   tg_send "🟠 <b>zapret2-slipstream — прервано</b>
@@ -365,8 +464,15 @@ run_protocol() {
   ENABLE_HTTP=0 ENABLE_HTTPS_TLS12=$EN_TLS12 ENABLE_HTTPS_TLS13=$EN_TLS13 ENABLE_HTTP3=$EN_HTTP3 \
   CURL_TEST_HTTP=0 CURL_TEST_HTTPS_TLS12=$CT_TLS12 CURL_TEST_HTTPS_TLS13=$CT_TLS13 CURL_TEST_QUIC=$CT_QUIC \
   BATCH=1 PARALLEL=1 \
-    "$BLOCKCHECK" >"$RUN_LOG" 2>&1 &
+    $SETSID "$BLOCKCHECK" >"$RUN_LOG" 2>&1 &
   BC_PID=$!
+  # setsid не должен форкаться (мы не лидер группы) → pgid blockcheck == его pid.
+  # Если это не так (job control? интерактивный sh?), убийство группой не сработает —
+  # тогда вся надежда на sweep_blockcheck. Не молчим об этом.
+  if [ -n "$SETSID" ]; then
+    _pg="$(ps -o pgid= -p "$BC_PID" 2>/dev/null | tr -d ' ')"
+    [ "$_pg" = "$BC_PID" ] || say "    [$proto] !!! blockcheck не в своей группе процессов (pid=$BC_PID pgid=${_pg:-?}) — group-kill не сработает, полагаюсь на sweep"
+  fi
 
   run_start=$(date +%s)
   while :; do
@@ -407,14 +513,18 @@ run_protocol() {
   done
   wait "$BC_PID" 2>/dev/null
   BC_PID=""
-  # подчистить таблицу blockcheck, если осталась после kill
-  nft list tables 2>/dev/null | grep -q 'blockcheck' && nft delete table inet blockcheck 2>/dev/null
+  # blockcheck прибит или завершился — вычистить всё, что он мог оставить
+  sweep_blockcheck " $proto"
 }
 
 # ---------- начало ----------
 say ">>> Останавливаю $SERVICE, чищу conntrack..."
 systemctl stop "$SERVICE" 2>/dev/null
+# дать сервису реально погасить свои nfqws2, прежде чем считать оставшиеся чужими
+_i=0; while [ "$_i" -lt 10 ] && systemctl is-active --quiet "$SERVICE"; do sleep 0.5; _i=$((_i+1)); done
 conntrack -F >/dev/null 2>&1
+# сиротки от ПРОШЛЫХ прогонов (если они есть — они всё это время портили трафик)
+sweep_blockcheck " start"
 
 # человекочитаемое описание лимитов для отчёта
 fmt_want() { [ "$1" -eq 0 ] && printf 'полный перебор' || printf '%s шт' "$1"; }
@@ -648,7 +758,7 @@ if [ "$TLS_NOBP" = "1" ] && [ "$QUIC_NOBP" = "1" ]; then
   tg_send "ℹ️ <b>zapret2-slipstream — без изменений</b>
 Сейчас и TLS, и QUIC проходят напрямую (блокировка снята).
 Конфиг не тронут, текущая стратегия сохранена.
-<b>Время:</b> $(elapsed)"
+<b>Время:</b> $(elapsed)$(strays_msg)"
   exit 0
 fi
 
@@ -761,7 +871,7 @@ if [ "$DRY" = "1" ]; then
 <b>Время:</b> $(elapsed)
 
 <b>NFQWS2_OPT:</b>
-<pre><code class="language-bash">$OPT_HTML</code></pre>$SPARE_MSG"
+<pre><code class="language-bash">$OPT_HTML</code></pre>$SPARE_MSG$(strays_msg)"
   exit 0
 fi
 
@@ -812,7 +922,7 @@ if systemctl is-active --quiet "$SERVICE"; then
 <b>Время:</b> $(elapsed)
 
 <b>NFQWS2_OPT:</b>
-<pre><code class="language-bash">$OPT_HTML</code></pre>$SPARE_MSG"
+<pre><code class="language-bash">$OPT_HTML</code></pre>$SPARE_MSG$(strays_msg)"
 else
   say "!!! $SERVICE не поднялся. Откат:"
   say "    sudo cp $CONFIG.bak-$STAMP $CONFIG && sudo systemctl restart $SERVICE"
